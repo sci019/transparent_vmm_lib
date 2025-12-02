@@ -202,9 +202,11 @@ classDiagram
 
 本システムにおける主要な3つのユースケースについて、コンポーネント間の相互作用と、**ポインタ変数の操作** および **呼び出される具体的なドライバ API** を定義する。
 
-#### 1. 通常時のメモリ確保 (Normal Allocation Flow)
-アプリケーションが `cudaMalloc` を要求し、プール内の物理メモリがヒットする場合の最速パスである。
+#### 1. 物理メモリの生成と再利用 (Lifecycle: Create -> Pool -> Reuse)
+アプリケーションが `cudaMalloc` と `cudaFree` を繰り返す際、ライブラリ内部で物理メモリがどのように「資産化（キャッシュ）」され、高速な再利用（Hot Path）へと繋がるかを示す。
+
 `cudaMalloc` は通常、内部で `cuMemAlloc` 等を呼ぶが、本ライブラリはそれを遮断し、自らが管理する仮想アドレス (`va_ptr`) をアプリ側のポインタ変数 (`*devPtr`) に書き込む。
+
 
 ```mermaid
 sequenceDiagram
@@ -213,45 +215,127 @@ sequenceDiagram
     participant Mgr as VmmManager
     participant Alloc as Allocator
     participant Pool as PhysicalPool
+    participant Trk as VmmTracker
     participant Drv as DriverWrapper
     participant Cuda as libcuda.so
 
+    %% --- Phase 1: 初回確保 (Cold Path) ---
+    Note over App, Cuda: 【Phase 1】初回確保 (プールは空)
     App->>Hook: cudaMalloc(devPtr, size)
     activate Hook
-    Hook->>Mgr: allocate(&va_ptr, size)
+    Hook->>Mgr: allocate(devPtr, size)
     activate Mgr
     
     %% 1. VA確保
     Mgr->>Alloc: alloc(aligned_size)
     activate Alloc
-    Alloc-->>Mgr: return va_ptr
+    Alloc-->>Mgr: return va_ptr_A
     deactivate Alloc
 
-    %% 2. PA確保 (プール利用)
-    Mgr->>Pool: pop(aligned_size)
+    %% 2. PA確保 (Pool Miss -> Create)
+    Mgr->>Pool: pop(size)
     activate Pool
-    Pool-->>Mgr: return handle (Hit)
+    Pool-->>Mgr: null (Miss)
     deactivate Pool
     
-    Note right of Pool: 新規作成(cuMemCreate)を<br>スキップして高速化
-
-    %% 3. マッピング (Driver API呼び出し)
-    Mgr->>Drv: map_memory(va_ptr, handle)
+    Note right of Mgr: 在庫がないため、OSから新規作成
+    Mgr->>Drv: create_physical_mem(size)
     activate Drv
-    Drv->>Cuda: cuMemMap(va_ptr, handle)
-    Drv->>Cuda: cuMemSetAccess(va_ptr, RW)
+    Drv->>Cuda: cuMemCreate(size)
+    Cuda-->>Drv: return Handle_A
+    Drv-->>Mgr: return Handle_A
+    deactivate Drv
+
+    %% 3. マッピング
+    Mgr->>Drv: map_memory(va_ptr_A, Handle_A)
+    activate Drv
+    Drv->>Cuda: cuMemMap(va_ptr_A, Handle_A)
+    Drv->>Cuda: cuMemSetAccess(va_ptr_A, RW)
     Drv-->>Mgr: Success
     deactivate Drv
+    
+    %% 4. 追跡登録
+    Mgr->>Trk: register_alloc(va_ptr_A, info)
+    activate Trk
+    Trk-->>Mgr: Success
+    deactivate Trk
+
+    %% 5. ポインタ書き換え
+    Note right of Mgr: *devPtr = va_ptr_A
 
     Mgr-->>Hook: return Success
     deactivate Mgr
+    Hook-->>App: return cudaSuccess
+    deactivate Hook
 
-    %% ポインタの書き換え
-    Note right of Hook: *devPtr = va_ptr<br>(アプリに仮想アドレスを渡す)
+    %% --- Phase 2: 解放とプールへの格納 ---
+    Note over App, Cuda: 【Phase 2】解放 (OSへ返さずプールへ)
+    App->>Hook: cudaFree(ptr_A)
+    activate Hook
+    Hook->>Mgr: free(ptr_A)
+    activate Mgr
     
+    Mgr->>Trk: get_alloc(ptr_A)
+    activate Trk
+    Trk-->>Mgr: return info (Handle_A)
+    deactivate Trk
+
+    Mgr->>Drv: unmap_memory(va_ptr_A)
+    activate Drv
+    Drv->>Cuda: cuMemUnmap(va_ptr_A)
+    Drv-->>Mgr: Success
+    deactivate Drv
+    
+    Note right of Mgr: 物理メモリ(Handle_A)を<br>捨てずにプールへ預ける
+    Mgr->>Pool: push(size, Handle_A)
+    activate Pool
+    Pool-->>Mgr: stored
+    deactivate Pool
+
+    Mgr->>Alloc: free(va_ptr_A)
+    Mgr->>Trk: unregister_alloc(ptr_A)
+
+    Mgr-->>Hook: return Success
+    deactivate Mgr
+    Hook-->>App: return cudaSuccess
+    deactivate Hook
+
+    %% --- Phase 3: 再利用 (Hot Path) ---
+    Note over App, Cuda: 【Phase 3】再確保 (プールから高速再利用)
+    App->>Hook: cudaMalloc(devPtr, size)
+    activate Hook
+    Hook->>Mgr: allocate(devPtr, size)
+    activate Mgr
+
+    Mgr->>Alloc: alloc(aligned_size)
+    Alloc-->>Mgr: return va_ptr_B
+
+    %% PA確保 (Pool Hit)
+    Mgr->>Pool: pop(size)
+    activate Pool
+    Note right of Pool: さっき預けた Handle_A を発見
+    Pool-->>Mgr: return Handle_A (Hit!)
+    deactivate Pool
+
+    Note right of Mgr: ★重い cuMemCreate をスキップ
+
+    Mgr->>Drv: map_memory(va_ptr_B, Handle_A)
+    activate Drv
+    Drv->>Cuda: cuMemMap(va_ptr_B, Handle_A)
+    Drv->>Cuda: cuMemSetAccess(va_ptr_B, RW)
+    Drv-->>Mgr: Success
+    deactivate Drv
+
+    Mgr->>Trk: register_alloc(va_ptr_B, info)
+    Note right of Mgr: *devPtr = va_ptr_B
+
+    Mgr-->>Hook: return Success
+    deactivate Mgr
     Hook-->>App: return cudaSuccess
     deactivate Hook
 ```
+
+
 
 #### 2. OOM検知と自律回復 (OOM Recovery Flow)
 リソース枯渇時に発生する `cuMemCreate` や `cuMemSetAccess` のエラーを捕捉し、プールを緊急解放（Drain）してリトライするフローである。

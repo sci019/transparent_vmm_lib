@@ -198,8 +198,57 @@ Driver API を操作する上で避けて通れない制約が **アライメン
 * **端数処理**: アプリが `101MB` を要求した場合、物理メモリは `102MB` (2MB × 51) 確保される。
 * **管理の分離**: `VmmTracker` において、アプリが認識する `user_size (101MB)` と、実際に確保した `mapped_size (102MB)` を別々に管理することで、`cudaMemcpy` 時のサイズ不一致判定などのバグを防いでいる。
 
+### 3.3 物理リソースの「資産化」とキャッシング (Physical Resource Pooling)
 
-### 3.3 ゼロコピー・リマップロジック (Zero-Copy Remap Logic)
+本ライブラリが `cudaMalloc` を爆速化できる最大の理由は、物理メモリを「その場限りの使い捨て」から「再利用可能な資産」へと変えた点にある。
+第2章のシーケンス図で示した「プール内の在庫」がどのように形成され、循環しているかを定義する。
+
+#### 1. 物理メモリのライフサイクル比較
+従来の Runtime API と、本ライブラリ（VMM Pool）における物理メモリの扱い（ライフサイクル）を比較する。
+
+| フェーズ | 従来 (Runtime API) | **本ライブラリ (VMM Pool)** |
+| :--- | :--- | :--- |
+| **確保 (Alloc)** | 毎回 OS に `cuMemCreate` を要求。<br>→ **重い (数ms〜)** | まずプールを確認。在庫があればそれを使う。<br>→ **一瞬 (数μs)** |
+| **利用 (Use)** | アプリが使用。 | アプリが使用。 |
+| **解放 (Free)** | 即座に OS に `cuMemRelease` で返却。<br>→ **捨てる (破棄)** | OS には返さず、プールに `push` して保管。<br>→ **資産化 (Cache)** |
+
+#### 2. "Hot Path" の形成
+アプリケーションが `malloc` と `free` を繰り返す場合、本ライブラリ内部では以下のような循環（サイクル）が形成される。
+
+```mermaid
+graph TD
+    subgraph OS["OS / GPU Driver"]
+        Create["cuMemCreate<br>(Heavy System Call)"]
+    end
+
+    subgraph Library["VMM Library"]
+        direction TB
+        Pool[("Physical Pool<br>(Handle Warehouse)")]
+        User[Application Use]
+    end
+
+    %% Cold Path
+    Create -- "1. 初回のみ作成 (Cold Path)" --> Pool
+    
+    %% Hot Path
+    Pool -- "2. pop (Alloc)" --> User
+    User -- "3. push (Free)" --> Pool
+    
+    style Create fill:#fcc,stroke:#333
+    style Pool fill:#bbf,stroke:#333
+    style User fill:#efe,stroke:#333
+    
+    linkStyle 1,2 stroke-width:4px,stroke:#00aa00
+```
+
+1.  **Cold Path (初回)**: プールが空の場合のみ、仕方なく `cuMemCreate` を呼ぶ。これにはコストがかかる。
+2.  **Hot Path (2回目以降)**: 一度確保された物理メモリは、アプリが手放しても (`Free`) プールに戻るだけである。次回の `Alloc` 要求には、このプール内のメモリが即座に提供されるため、OS との通信コストがゼロになる。
+
+実験における **「Loop 1 (92ms) → Loop 2 (20ms)」** という劇的な変化は、処理が Cold Path から Hot Path へ移行したことを示している。
+
+---
+
+### 3.4 ゼロコピー・リマップロジック (Zero-Copy Remap Logic)
 
 本ライブラリが達成した「リサイズ性能 8倍高速化」の源泉は、データコピー（$O(N)$）を物理メモリのリマッピング（$O(1)$）に置換する **ゼロコピー・リマップロジック** にある。
 通常、データの移動を伴う `cudaMemcpy` を、本ライブラリは「物理メモリの所有権移転」というメタデータ操作へと昇華させる。
@@ -266,7 +315,7 @@ flowchart TD
 これにより、ユーザーは「データの維持」と「領域の拡張」を同時に、かつコストゼロで享受することができる。
 
 
-### 3.4 断片化比率フィルタ (Fragment Ratio Filter)
+### 3.5 断片化比率フィルタ (Fragment Ratio Filter)
 
 スキャッター・ギャザーは強力な機能であるが、無制限な断片利用は新たなボトルネックを生む。「塵も積もれば山となる」が、GPU ドライバにおいて「塵（極小の断片）」を大量に積むことは、管理テーブルの爆発と API エラー（`MemSetAccess: out of memory`）を招く危険な行為である。
 
