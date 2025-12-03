@@ -2,8 +2,7 @@
 mkdir -p lib bin
 CUDA_PATH=/usr/local/cuda
 
-# vmm_pool.cpp を追加
-SRCS="src/vmm_env.cpp src/vmm_driver_wrapper.cpp src/vmm_allocator.cpp src/vmm_pool.cpp src/vmm_tracker.cpp src/vmm_optimizer.cpp src/vmm_manager.cpp src/hook.cpp"
+SRCS="src/vmm_env.cpp src/vmm_logger.cpp src/vmm_driver_wrapper.cpp src/vmm_allocator.cpp src/vmm_pool.cpp src/vmm_tracker.cpp src/vmm_optimizer.cpp src/vmm_manager.cpp src/hook.cpp"
 
 echo "Building VMM Hook Library..."
 g++ -shared -fPIC -o lib/libvmm_hook.so $SRCS \
